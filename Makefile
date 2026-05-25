@@ -1,7 +1,7 @@
 BINARY=content
 BUILD_DIR=./bin
 
-.PHONY: build run-cron run-cron-now run-plan run-daily run-sync-avatars run-check-videos run-check-approval run-status run-compose run-edit clean tidy
+.PHONY: build run-cron run-cron-now run-plan run-daily run-sync-avatars run-check-videos run-check-approval run-status run-compose run-edit init uninstall clean tidy
 
 build:
 	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/content
@@ -38,6 +38,12 @@ run-compose: build
 
 run-edit: build
 	$(BUILD_DIR)/$(BINARY) edit $(ID)
+
+init: build
+	$(BUILD_DIR)/$(BINARY) init
+
+uninstall: build
+	$(BUILD_DIR)/$(BINARY) uninstall
 
 clean:
 	rm -rf $(BUILD_DIR)

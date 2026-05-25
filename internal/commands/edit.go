@@ -5,12 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/varmiguemunoz/content-automation/internal/config"
 	"github.com/varmiguemunoz/content-automation/internal/db"
 	"github.com/varmiguemunoz/content-automation/internal/editor"
 	"github.com/varmiguemunoz/content-automation/internal/evolution"
+	"github.com/varmiguemunoz/content-automation/internal/media"
+	"github.com/varmiguemunoz/content-automation/internal/notify"
 )
 
 func NewEditCmd(cfg *config.Config, database *db.DB) *cobra.Command {
@@ -85,6 +88,8 @@ func runEdit(cfg *config.Config, database *db.DB, planID int64) error {
 
 	fmt.Printf("\n✅ Video final listo: %s\n", outputPath)
 
+	notify.Desktop("🎬 Video listo", plan.Topic)
+
 	if cfg.EvolutionBaseURL != "" && cfg.WhatsAppNumber != "" {
 		script, _ := database.GetScriptByPlanID(planID)
 		caption := ""
@@ -92,11 +97,22 @@ func runEdit(cfg *config.Config, database *db.DB, planID int64) error {
 			caption = script.CaptionInstagram
 		}
 		evoClient := evolution.New(cfg)
-		msg := buildFinalVideoMessage(planID, plan.Topic, outputPath, caption)
-		if err := evoClient.SendText(cfg.WhatsAppNumber, msg); err != nil {
-			fmt.Printf("⚠️  WhatsApp: %v\n", err)
+
+		fmt.Println("⏳ Levantando servidor temporal para enviar video...")
+		videoURL, serveErr := media.ServeFileTemporarily(outputPath, 5*time.Minute)
+		if serveErr != nil {
+			fmt.Printf("⚠️  No se pudo servir el video: %v\nEnviando texto como fallback...\n", serveErr)
+			msg := buildFinalVideoMessage(planID, plan.Topic, outputPath, caption)
+			_ = evoClient.SendText(cfg.WhatsAppNumber, msg)
 		} else {
-			fmt.Println("📱 Notificación enviada por WhatsApp")
+			fmt.Printf("🌐 Video disponible en: %s\n", videoURL)
+			if err := evoClient.SendVideo(cfg.WhatsAppNumber, videoURL, fmt.Sprintf("🎬 %s\n\nAPPROVE %d o REJECT %d", plan.Topic, planID, planID)); err != nil {
+				fmt.Printf("⚠️  WhatsApp SendVideo: %v\nEnviando texto como fallback...\n", err)
+				msg := buildFinalVideoMessage(planID, plan.Topic, videoURL, caption)
+				_ = evoClient.SendText(cfg.WhatsAppNumber, msg)
+			} else {
+				fmt.Println("📱 Video enviado por WhatsApp")
+			}
 		}
 	}
 

@@ -144,6 +144,47 @@ func (c *Client) FindRecentMessagesFrom(number string, since time.Time) ([]Messa
 	return result.Messages.Records, nil
 }
 
+type SendMediaRequest struct {
+	Number    string `json:"number"`
+	MediaType string `json:"mediatype"`
+	MimeType  string `json:"mimetype"`
+	Caption   string `json:"caption"`
+	Media     string `json:"media"`
+	FileName  string `json:"fileName"`
+}
+
+func (c *Client) SendVideo(number, videoURL, caption string) error {
+	payload := SendMediaRequest{
+		Number:    number,
+		MediaType: "video",
+		MimeType:  "video/mp4",
+		Caption:   caption,
+		Media:     videoURL,
+		FileName:  "final_video.mp4",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("%s/message/sendMedia/%s", c.baseURL, c.instance)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("apikey", c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("enviando video: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("EvolutionAPI error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 func (c *Client) ExtractApprovalFromMessages(messages []Message) (action string, planID int64) {
 	for _, msg := range messages {
 		text := msg.Message.Conversation

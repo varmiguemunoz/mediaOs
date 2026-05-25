@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/varmiguemunoz/content-automation/internal/config"
@@ -13,6 +14,8 @@ import (
 	"github.com/varmiguemunoz/content-automation/internal/editor"
 	"github.com/varmiguemunoz/content-automation/internal/evolution"
 	"github.com/varmiguemunoz/content-automation/internal/heygen"
+	"github.com/varmiguemunoz/content-automation/internal/media"
+	"github.com/varmiguemunoz/content-automation/internal/notify"
 )
 
 func NewCheckVideosCmd(cfg *config.Config, database *db.DB) *cobra.Command {
@@ -86,23 +89,28 @@ func runCheckVideos(cfg *config.Config, database *db.DB) error {
 					_ = database.UpdateEditJob(jobID, "edit_ready", outputPath, "")
 					_ = database.UpdateContentPlanStatus(plan.ID, "pending_approval")
 					fmt.Printf("  ✅ Video final listo: %s\n", outputPath)
+					notify.Desktop("🎬 Video listo", plan.Topic)
 
 					if cfg.EvolutionBaseURL != "" && cfg.WhatsAppNumber != "" {
 						caption := ""
 						if script != nil {
 							caption = script.CaptionInstagram
 						}
-						msg := buildFinalVideoMessage(plan.ID, plan.Topic, outputPath, caption)
-						if err := evoClient.SendText(cfg.WhatsAppNumber, msg); err != nil {
-							fmt.Printf("  ⚠️  WhatsApp: %v\n", err)
-						} else {
-							notified++
+						videoURL, serveErr := media.ServeFileTemporarily(outputPath, 5*time.Minute)
+						if serveErr != nil {
+							msg := buildFinalVideoMessage(plan.ID, plan.Topic, outputPath, caption)
+							_ = evoClient.SendText(cfg.WhatsAppNumber, msg)
+						} else if sendErr := evoClient.SendVideo(cfg.WhatsAppNumber, videoURL, fmt.Sprintf("🎬 %s\n\nAPPROVE %d o REJECT %d", plan.Topic, plan.ID, plan.ID)); sendErr != nil {
+							msg := buildFinalVideoMessage(plan.ID, plan.Topic, videoURL, caption)
+							_ = evoClient.SendText(cfg.WhatsAppNumber, msg)
 						}
+						notified++
 					}
 				}
 			} else {
 				_ = database.UpdateContentPlanStatus(plan.ID, "pending_approval")
 				fmt.Printf("  ℹ️  HeyGen listo pero sin composición. Enviando URL de HeyGen directamente.\n")
+				notify.Desktop("🎬 Video HeyGen listo", plan.Topic)
 				if cfg.EvolutionBaseURL != "" && cfg.WhatsAppNumber != "" {
 					caption := ""
 					if script != nil {

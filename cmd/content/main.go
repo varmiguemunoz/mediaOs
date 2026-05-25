@@ -11,9 +11,24 @@ import (
 )
 
 func main() {
+	root := &cobra.Command{
+		Use:   "content",
+		Short: "Sistema de generación de contenido automatizado",
+	}
+
+	root.AddCommand(commands.NewInitCmd())
+	root.AddCommand(commands.NewUninstallCmd())
+
 	cfg, err := config.Load()
 	if err != nil {
+		if isInitOrUninstall() {
+			if err := root.Execute(); err != nil {
+				os.Exit(1)
+			}
+			return
+		}
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tip: corre 'content init' para configurar el proyecto.\n")
 		os.Exit(1)
 	}
 
@@ -23,11 +38,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer database.Close()
-
-	root := &cobra.Command{
-		Use:   "content",
-		Short: "Sistema de generación de contenido automatizado",
-	}
 
 	root.AddCommand(
 		commands.NewCronCmd(cfg, database),
@@ -45,4 +55,13 @@ func main() {
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func isInitOrUninstall() bool {
+	for _, arg := range os.Args[1:] {
+		if arg == "init" || arg == "uninstall" {
+			return true
+		}
+	}
+	return false
 }
