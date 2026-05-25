@@ -30,6 +30,7 @@ func main() {
 	}
 
 	root.AddCommand(
+		commands.NewCronCmd(cfg, database),
 		commands.NewPlanCmd(cfg, database),
 		commands.NewDailyCmd(cfg, database),
 		commands.NewSyncAvatarsCmd(cfg, database),
@@ -37,6 +38,8 @@ func main() {
 		commands.NewCheckApprovalCmd(cfg, database),
 		commands.NewApproveCmd(cfg, database),
 		commands.NewStatusCmd(cfg, database),
+		commands.NewComposeCmd(cfg, database),
+		commands.NewEditCmd(cfg, database),
 	)
 
 	if err := root.Execute(); err != nil {

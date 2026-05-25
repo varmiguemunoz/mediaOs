@@ -2,14 +2,18 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/varmiguemunoz/content-automation/internal/config"
 	"github.com/varmiguemunoz/content-automation/internal/db"
 	"github.com/varmiguemunoz/content-automation/internal/heygen"
+	"github.com/varmiguemunoz/content-automation/internal/hyperframes"
 	"github.com/varmiguemunoz/content-automation/internal/openai"
 )
 
@@ -63,7 +67,17 @@ func runDaily(cfg *config.Config, database *db.DB) error {
 	}
 
 	wordCount := len(strings.Fields(script.Script))
-	fmt.Printf("✅ Script generado (%d palabras)\n\n", wordCount)
+	fmt.Printf("✅ Script generado (%d palabras, %d segmentos de timeline)\n\n", wordCount, len(script.Timeline))
+
+	timelineJSON := ""
+	if len(script.Timeline) > 0 {
+		raw, err := json.Marshal(script.Timeline)
+		if err != nil {
+			fmt.Printf("⚠️  No se pudo serializar el timeline: %v\n", err)
+		} else {
+			timelineJSON = string(raw)
+		}
+	}
 
 	scriptID, err := database.InsertGeneratedScript(db.GeneratedScript{
 		ContentPlanID:            plan.ID,
@@ -77,6 +91,7 @@ func runDaily(cfg *config.Config, database *db.DB) error {
 		CTA:                      script.CTA,
 		EstimatedDurationSeconds: script.EstimatedDurationSeconds,
 		WordCount:                wordCount,
+		TimelineJSON:             timelineJSON,
 	})
 	if err != nil {
 		return fmt.Errorf("guardando script: %w", err)
@@ -87,29 +102,73 @@ func runDaily(cfg *config.Config, database *db.DB) error {
 		return fmt.Errorf("actualizando estado: %w", err)
 	}
 
-	heygenClient := heygen.New(cfg)
-	fmt.Println("⏳ Enviando a HeyGen...")
+	var (
+		wg          sync.WaitGroup
+		heygenID    string
+		heygenErr   error
+		composeErr  error
+		compJobID   int64
+	)
 
-	videoID, err := heygenClient.CreateVideo(avatar.HeyGenAvatarID, avatar.HeyGenVoiceID, script.Script)
-	if err != nil {
-		return fmt.Errorf("creando video en HeyGen: %w", err)
-	}
+	wg.Add(2)
 
-	_, err = database.InsertVideoRenderJob(db.VideoRenderJob{
-		ContentPlanID: plan.ID,
-		HeyGenVideoID: videoID,
-	})
-	if err != nil {
-		return fmt.Errorf("guardando render job: %w", err)
-	}
+	go func() {
+		defer wg.Done()
+		fmt.Println("🤖 [Agente 1] Enviando a HeyGen...")
+		hc := heygen.New(cfg)
+		heygenID, heygenErr = hc.CreateVideo(avatar.HeyGenAvatarID, avatar.HeyGenVoiceID, script.Script)
+		if heygenErr != nil {
+			fmt.Printf("❌ [Agente 1] HeyGen error: %v\n", heygenErr)
+			return
+		}
+		if _, err := database.InsertVideoRenderJob(db.VideoRenderJob{
+			ContentPlanID: plan.ID,
+			HeyGenVideoID: heygenID,
+		}); err != nil {
+			heygenErr = fmt.Errorf("guardando render job: %w", err)
+			return
+		}
+		_ = database.UpdateAvatarLastUsed(avatar.ID)
+		_ = database.UpdateContentPlanStatus(plan.ID, "video_requested")
+		fmt.Printf("✅ [Agente 1] HeyGen video en cola: %s\n", heygenID)
+	}()
 
-	if err := database.UpdateAvatarLastUsed(avatar.ID); err != nil {
-		fmt.Printf("⚠️  No se pudo actualizar last_used_at del avatar: %v\n", err)
-	}
+	go func() {
+		defer wg.Done()
+		if timelineJSON == "" || len(script.Timeline) == 0 {
+			fmt.Println("⚠️  [Agente 2] Sin timeline, saltando HyperFrames")
+			return
+		}
+		fmt.Println("🤖 [Agente 2] Iniciando composición HyperFrames...")
+		var jobIDErr error
+		compJobID, jobIDErr = database.InsertCompositionJob(db.CompositionJob{ContentPlanID: plan.ID})
+		if jobIDErr != nil {
+			composeErr = fmt.Errorf("creando composition_job: %w", jobIDErr)
+			return
+		}
+		_ = database.UpdateCompositionJob(compJobID, "rendering", "", "", "")
 
-	if err := database.UpdateContentPlanStatus(plan.ID, "video_requested"); err != nil {
-		return fmt.Errorf("actualizando estado: %w", err)
-	}
+		ai := openai.New(cfg)
+		runner := hyperframes.New(cfg, ai)
+		htmlPath, videoPath, err := runner.Compose(ctx, hyperframes.CompositionInput{
+			PlanID:   plan.ID,
+			Topic:    plan.Topic,
+			Pillar:   plan.Pillar,
+			Timeline: script.Timeline,
+			Captions: script.Captions,
+		}, os.Stdout)
+
+		if err != nil {
+			composeErr = err
+			_ = database.UpdateCompositionJob(compJobID, "failed", htmlPath, "", err.Error())
+			fmt.Printf("❌ [Agente 2] HyperFrames error: %v\n", err)
+			return
+		}
+		_ = database.UpdateCompositionJob(compJobID, "composition_ready", htmlPath, videoPath, "")
+		fmt.Printf("✅ [Agente 2] Composición lista: %s\n", videoPath)
+	}()
+
+	wg.Wait()
 
 	fmt.Println("\n" + strings.Repeat("─", 60))
 	fmt.Println("🎬 RESUMEN DEL DÍA")
@@ -117,13 +176,23 @@ func runDaily(cfg *config.Config, database *db.DB) error {
 	fmt.Printf("Tema:        %s\n", plan.Topic)
 	fmt.Printf("Avatar:      %s\n", avatar.Name)
 	fmt.Printf("Script:      %d palabras\n", wordCount)
-	fmt.Printf("HeyGen ID:   %s\n", videoID)
-	fmt.Printf("Estado:      video_requested\n")
+	if heygenErr == nil {
+		fmt.Printf("HeyGen ID:   %s ✅\n", heygenID)
+	} else {
+		fmt.Printf("HeyGen:      ❌ %v\n", heygenErr)
+	}
+	if composeErr == nil && compJobID > 0 {
+		fmt.Printf("Composición: ✅ job #%d\n", compJobID)
+	} else if composeErr != nil {
+		fmt.Printf("Composición: ❌ %v\n", composeErr)
+	} else {
+		fmt.Println("Composición: ⏭ saltada (sin timeline)")
+	}
 	fmt.Println(strings.Repeat("─", 60))
 	fmt.Println("\n📜 Script:")
 	fmt.Println()
 	fmt.Println(script.Script)
 	fmt.Println()
-	fmt.Println("⏳ El video está renderizando. Corre 'content check-videos' para revisar el estado.")
+	fmt.Println("⏳ Corre 'content check-videos' para detectar cuando HeyGen termine y lanzar el editor.")
 	return nil
 }

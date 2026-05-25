@@ -2,11 +2,15 @@ package commands
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/varmiguemunoz/content-automation/internal/config"
 	"github.com/varmiguemunoz/content-automation/internal/db"
+	"github.com/varmiguemunoz/content-automation/internal/editor"
 	"github.com/varmiguemunoz/content-automation/internal/evolution"
 	"github.com/varmiguemunoz/content-automation/internal/heygen"
 )
@@ -62,30 +66,57 @@ func runCheckVideos(cfg *config.Config, database *db.DB) error {
 				continue
 			}
 
-			if err := database.UpdateContentPlanStatus(plan.ID, "pending_approval"); err != nil {
-				fmt.Printf("  ⚠️  Error actualizando estado del plan: %v\n", err)
-				continue
-			}
+			script, _ := database.GetScriptByPlanID(plan.ID)
 
-			script, err := database.GetScriptByPlanID(plan.ID)
-			if err != nil || script == nil {
-				fmt.Printf("  ⚠️  Script no encontrado para plan %d\n", plan.ID)
-				continue
-			}
+			compJob, _ := database.GetCompositionJobByPlanID(plan.ID)
+			if compJob != nil && compJob.Status == "composition_ready" {
+				fmt.Printf("  🎬 Composición lista — lanzando Agente 3 (FFmpeg)...\n")
+				outputPath := filepath.Join(cfg.EditsDir, strconv.FormatInt(plan.ID, 10), "final_video.mp4")
+				jobID, _ := database.InsertEditJob(db.EditJob{
+					ContentPlanID:        plan.ID,
+					HeyGenVideoURL:       videoURL,
+					CompositionVideoPath: compJob.VideoPath,
+				})
+				comp := editor.New(cfg.EditorLayout)
+				editErr := comp.Composite(videoURL, compJob.VideoPath, outputPath, os.Stdout)
+				if editErr != nil {
+					_ = database.UpdateEditJob(jobID, "failed", "", editErr.Error())
+					fmt.Printf("  ❌ FFmpeg falló: %v\n", editErr)
+				} else {
+					_ = database.UpdateEditJob(jobID, "edit_ready", outputPath, "")
+					_ = database.UpdateContentPlanStatus(plan.ID, "pending_approval")
+					fmt.Printf("  ✅ Video final listo: %s\n", outputPath)
 
-			if cfg.EvolutionBaseURL == "" || cfg.WhatsAppNumber == "" {
-				fmt.Printf("  ℹ️  Video listo pero EvolutionAPI no configurada. URL: %s\n", videoURL)
-				continue
+					if cfg.EvolutionBaseURL != "" && cfg.WhatsAppNumber != "" {
+						caption := ""
+						if script != nil {
+							caption = script.CaptionInstagram
+						}
+						msg := buildFinalVideoMessage(plan.ID, plan.Topic, outputPath, caption)
+						if err := evoClient.SendText(cfg.WhatsAppNumber, msg); err != nil {
+							fmt.Printf("  ⚠️  WhatsApp: %v\n", err)
+						} else {
+							notified++
+						}
+					}
+				}
+			} else {
+				_ = database.UpdateContentPlanStatus(plan.ID, "pending_approval")
+				fmt.Printf("  ℹ️  HeyGen listo pero sin composición. Enviando URL de HeyGen directamente.\n")
+				if cfg.EvolutionBaseURL != "" && cfg.WhatsAppNumber != "" {
+					caption := ""
+					if script != nil {
+						caption = script.CaptionInstagram
+					}
+					msg := buildApprovalMessage(plan.ID, plan.Topic, videoURL, caption)
+					if err := evoClient.SendText(cfg.WhatsAppNumber, msg); err != nil {
+						fmt.Printf("  ⚠️  WhatsApp: %v\n", err)
+					} else {
+						notified++
+					}
+				}
 			}
-
-			msg := buildApprovalMessage(plan.ID, plan.Topic, videoURL, script.CaptionInstagram)
-			if err := evoClient.SendText(cfg.WhatsAppNumber, msg); err != nil {
-				fmt.Printf("  ⚠️  Error enviando WhatsApp: %v\n", err)
-				continue
-			}
-
-			fmt.Printf("  ✅ Video listo y notificación enviada por WhatsApp (plan ID: %d)\n", plan.ID)
-			notified++
+			fmt.Printf("  ✅ Plan %d procesado\n", plan.ID)
 
 		case "failed":
 			if err := database.UpdateVideoRenderJob(job.ID, "failed", "", "HeyGen reportó fallo en el render"); err != nil {

@@ -8,13 +8,12 @@ import (
 	"github.com/varmiguemunoz/content-automation/internal/config"
 	"github.com/varmiguemunoz/content-automation/internal/db"
 	"github.com/varmiguemunoz/content-automation/internal/evolution"
-	"github.com/varmiguemunoz/content-automation/internal/services"
 )
 
 func NewCheckApprovalCmd(cfg *config.Config, database *db.DB) *cobra.Command {
 	return &cobra.Command{
 		Use:   "check-approval",
-		Short: "Verifica respuestas de aprobación en WhatsApp y publica si fue aprobado",
+		Short: "Detecta APPROVE/REJECT por WhatsApp y actualiza estado en DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCheckApproval(cfg, database)
 		},
@@ -29,7 +28,7 @@ func runCheckApproval(cfg *config.Config, database *db.DB) error {
 	evoClient := evolution.New(cfg)
 	since := time.Now().Add(-30 * time.Minute)
 
-	fmt.Printf("🔍 Buscando respuestas de aprobación en los últimos 30 minutos...\n\n")
+	fmt.Println("🔍 Buscando respuestas en los últimos 30 minutos...\n")
 
 	messages, err := evoClient.FindRecentMessagesFrom(cfg.WhatsAppNumber, since)
 	if err != nil {
@@ -37,13 +36,13 @@ func runCheckApproval(cfg *config.Config, database *db.DB) error {
 	}
 
 	if len(messages) == 0 {
-		fmt.Println("ℹ️  No hay mensajes nuevos de aprobación.")
+		fmt.Println("ℹ️  No hay mensajes nuevos.")
 		return nil
 	}
 
 	action, planID := evoClient.ExtractApprovalFromMessages(messages)
 	if action == "" {
-		fmt.Println("ℹ️  No se encontró ninguna instrucción APPROVE/REJECT en los mensajes recientes.")
+		fmt.Println("ℹ️  No se encontró APPROVE/REJECT en los mensajes recientes.")
 		return nil
 	}
 
@@ -52,42 +51,24 @@ func runCheckApproval(cfg *config.Config, database *db.DB) error {
 		return fmt.Errorf("plan ID %d no encontrado", planID)
 	}
 
-	if plan.Status != "pending_approval" {
-		fmt.Printf("ℹ️  El plan %d está en estado '%s', no en 'pending_approval'. Ignorando.\n", planID, plan.Status)
-		return nil
-	}
-
 	switch action {
 	case "approve":
-		fmt.Printf("✅ Aprobado: plan %d — %s\n\n", planID, plan.Topic)
-
 		job, err := database.GetVideoJobByPlanID(planID)
 		if err != nil || job == nil {
 			return fmt.Errorf("render job no encontrado para plan %d", planID)
 		}
-
-		script, err := database.GetScriptByPlanID(planID)
-		if err != nil || script == nil {
-			return fmt.Errorf("script no encontrado para plan %d", planID)
-		}
-
-		publisher := services.NewPublisher(cfg, database)
-		if err := publisher.Publish(plan, script, job.VideoURL); err != nil {
-			return fmt.Errorf("publicando: %w", err)
-		}
-
-		if err := database.UpdateContentPlanStatus(planID, "published"); err != nil {
+		if err := database.UpdateContentPlanStatus(planID, "approved"); err != nil {
 			return fmt.Errorf("actualizando estado: %w", err)
 		}
-
-		fmt.Printf("\n🎉 Publicado exitosamente en todas las plataformas.\n")
+		fmt.Printf("✅ Plan %d aprobado: %s\n", planID, plan.Topic)
+		fmt.Printf("   Video listo para publicar manualmente:\n   %s\n", job.VideoURL)
 
 	case "reject":
-		fmt.Printf("❌ Rechazado: plan %d — %s\n", planID, plan.Topic)
 		if err := database.UpdateContentPlanStatus(planID, "rejected"); err != nil {
 			return fmt.Errorf("actualizando estado: %w", err)
 		}
-		fmt.Println("   Estado actualizado a 'rejected'. Puedes regenerar el script con 'content daily'.")
+		fmt.Printf("❌ Plan %d rechazado: %s\n", planID, plan.Topic)
+		fmt.Println("   Puedes regenerar el script con 'content daily'.")
 	}
 
 	return nil

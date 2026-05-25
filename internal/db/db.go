@@ -35,20 +35,41 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) migrate() error {
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS _migrations (
+			name TEXT PRIMARY KEY,
+			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		return fmt.Errorf("creating migrations table: %w", err)
+	}
+
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return err
 	}
+
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		data, err := migrationsFS.ReadFile("migrations/" + e.Name())
+		name := e.Name()
+
+		var count int
+		_ = d.conn.QueryRow(`SELECT COUNT(*) FROM _migrations WHERE name = ?`, name).Scan(&count)
+		if count > 0 {
+			continue
+		}
+
+		data, err := migrationsFS.ReadFile("migrations/" + name)
 		if err != nil {
-			return fmt.Errorf("reading migration %s: %w", e.Name(), err)
+			return fmt.Errorf("reading migration %s: %w", name, err)
 		}
 		if _, err := d.conn.Exec(string(data)); err != nil {
-			return fmt.Errorf("executing migration %s: %w", e.Name(), err)
+			return fmt.Errorf("executing migration %s: %w", name, err)
+		}
+		if _, err := d.conn.Exec(`INSERT INTO _migrations (name) VALUES (?)`, name); err != nil {
+			return fmt.Errorf("recording migration %s: %w", name, err)
 		}
 	}
 	return nil
@@ -84,6 +105,7 @@ type GeneratedScript struct {
 	ContentPlanID            int64
 	Title                    string
 	Script                   string
+	TimelineJSON             string
 	CaptionInstagram         string
 	CaptionFacebook          string
 	CaptionLinkedIn          string
@@ -93,6 +115,29 @@ type GeneratedScript struct {
 	EstimatedDurationSeconds int
 	WordCount                int
 	CreatedAt                time.Time
+}
+
+type CompositionJob struct {
+	ID            int64
+	ContentPlanID int64
+	HTMLPath      string
+	VideoPath     string
+	Status        string
+	ErrorMessage  string
+	CreatedAt     time.Time
+	CompletedAt   *time.Time
+}
+
+type EditJob struct {
+	ID                    int64
+	ContentPlanID         int64
+	HeyGenVideoURL        string
+	CompositionVideoPath  string
+	FinalVideoPath        string
+	Status                string
+	ErrorMessage          string
+	CreatedAt             time.Time
+	CompletedAt           *time.Time
 }
 
 type VideoRenderJob struct {
@@ -206,9 +251,9 @@ func (d *DB) ListPendingPlans() ([]ContentPlan, error) {
 func (d *DB) InsertGeneratedScript(s GeneratedScript) (int64, error) {
 	res, err := d.conn.Exec(`
 		INSERT INTO generated_scripts
-			(content_plan_id, title, script, caption_instagram, caption_facebook, caption_linkedin, caption_tiktok, hashtags, cta, estimated_duration_seconds, word_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, s.ContentPlanID, s.Title, s.Script, s.CaptionInstagram, s.CaptionFacebook, s.CaptionLinkedIn, s.CaptionTikTok, s.Hashtags, s.CTA, s.EstimatedDurationSeconds, s.WordCount)
+			(content_plan_id, title, script, timeline_json, caption_instagram, caption_facebook, caption_linkedin, caption_tiktok, hashtags, cta, estimated_duration_seconds, word_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, s.ContentPlanID, s.Title, s.Script, s.TimelineJSON, s.CaptionInstagram, s.CaptionFacebook, s.CaptionLinkedIn, s.CaptionTikTok, s.Hashtags, s.CTA, s.EstimatedDurationSeconds, s.WordCount)
 	if err != nil {
 		return 0, err
 	}
@@ -217,10 +262,122 @@ func (d *DB) InsertGeneratedScript(s GeneratedScript) (int64, error) {
 
 func (d *DB) GetScriptByPlanID(planID int64) (*GeneratedScript, error) {
 	row := d.conn.QueryRow(`
-		SELECT id, content_plan_id, title, script, caption_instagram, caption_facebook, caption_linkedin, caption_tiktok, hashtags, cta, estimated_duration_seconds, word_count, created_at
+		SELECT id, content_plan_id, title, script, COALESCE(timeline_json,''), caption_instagram, caption_facebook, caption_linkedin, caption_tiktok, hashtags, cta, estimated_duration_seconds, word_count, created_at
 		FROM generated_scripts WHERE content_plan_id = ? ORDER BY created_at DESC LIMIT 1
 	`, planID)
 	return scanGeneratedScript(row)
+}
+
+func (d *DB) InsertCompositionJob(j CompositionJob) (int64, error) {
+	res, err := d.conn.Exec(`
+		INSERT INTO composition_jobs (content_plan_id, html_path, status)
+		VALUES (?, ?, 'composition_pending')
+	`, j.ContentPlanID, j.HTMLPath)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (d *DB) UpdateCompositionJob(id int64, status, htmlPath, videoPath, errMsg string) error {
+	if status == "composition_ready" || status == "failed" {
+		_, err := d.conn.Exec(`
+			UPDATE composition_jobs SET status=?, html_path=?, video_path=?, error_message=?, completed_at=CURRENT_TIMESTAMP WHERE id=?
+		`, status, htmlPath, videoPath, errMsg, id)
+		return err
+	}
+	_, err := d.conn.Exec(`
+		UPDATE composition_jobs SET status=?, html_path=?, video_path=?, error_message=? WHERE id=?
+	`, status, htmlPath, videoPath, errMsg, id)
+	return err
+}
+
+func (d *DB) GetCompositionJobByPlanID(planID int64) (*CompositionJob, error) {
+	row := d.conn.QueryRow(`
+		SELECT id, content_plan_id, html_path, video_path, status, error_message, created_at, completed_at
+		FROM composition_jobs WHERE content_plan_id = ? ORDER BY created_at DESC LIMIT 1
+	`, planID)
+	var j CompositionJob
+	var completedAt sql.NullTime
+	err := row.Scan(&j.ID, &j.ContentPlanID, &j.HTMLPath, &j.VideoPath, &j.Status, &j.ErrorMessage, &j.CreatedAt, &completedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if completedAt.Valid {
+		j.CompletedAt = &completedAt.Time
+	}
+	return &j, nil
+}
+
+func (d *DB) InsertEditJob(j EditJob) (int64, error) {
+	res, err := d.conn.Exec(`
+		INSERT INTO edit_jobs (content_plan_id, heygen_video_url, composition_video_path, status)
+		VALUES (?, ?, ?, 'edit_pending')
+	`, j.ContentPlanID, j.HeyGenVideoURL, j.CompositionVideoPath)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (d *DB) UpdateEditJob(id int64, status, finalVideoPath, errMsg string) error {
+	if status == "edit_ready" || status == "failed" {
+		_, err := d.conn.Exec(`
+			UPDATE edit_jobs SET status=?, final_video_path=?, error_message=?, completed_at=CURRENT_TIMESTAMP WHERE id=?
+		`, status, finalVideoPath, errMsg, id)
+		return err
+	}
+	_, err := d.conn.Exec(`
+		UPDATE edit_jobs SET status=?, final_video_path=?, error_message=? WHERE id=?
+	`, status, finalVideoPath, errMsg, id)
+	return err
+}
+
+func (d *DB) GetEditJobByPlanID(planID int64) (*EditJob, error) {
+	row := d.conn.QueryRow(`
+		SELECT id, content_plan_id, heygen_video_url, composition_video_path, final_video_path, status, error_message, created_at, completed_at
+		FROM edit_jobs WHERE content_plan_id = ? ORDER BY created_at DESC LIMIT 1
+	`, planID)
+	var j EditJob
+	var completedAt sql.NullTime
+	err := row.Scan(&j.ID, &j.ContentPlanID, &j.HeyGenVideoURL, &j.CompositionVideoPath, &j.FinalVideoPath, &j.Status, &j.ErrorMessage, &j.CreatedAt, &completedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if completedAt.Valid {
+		j.CompletedAt = &completedAt.Time
+	}
+	return &j, nil
+}
+
+func (d *DB) ListPendingEditJobs() ([]EditJob, error) {
+	rows, err := d.conn.Query(`
+		SELECT id, content_plan_id, heygen_video_url, composition_video_path, final_video_path, status, error_message, created_at, completed_at
+		FROM edit_jobs WHERE status = 'edit_pending'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []EditJob
+	for rows.Next() {
+		var j EditJob
+		var completedAt sql.NullTime
+		if err := rows.Scan(&j.ID, &j.ContentPlanID, &j.HeyGenVideoURL, &j.CompositionVideoPath, &j.FinalVideoPath, &j.Status, &j.ErrorMessage, &j.CreatedAt, &completedAt); err != nil {
+			return nil, err
+		}
+		if completedAt.Valid {
+			j.CompletedAt = &completedAt.Time
+		}
+		result = append(result, j)
+	}
+	return result, rows.Err()
 }
 
 func (d *DB) InsertVideoRenderJob(j VideoRenderJob) (int64, error) {
@@ -363,7 +520,7 @@ func scanContentPlans(rows *sql.Rows) ([]ContentPlan, error) {
 
 func scanGeneratedScript(row *sql.Row) (*GeneratedScript, error) {
 	var s GeneratedScript
-	err := row.Scan(&s.ID, &s.ContentPlanID, &s.Title, &s.Script, &s.CaptionInstagram, &s.CaptionFacebook, &s.CaptionLinkedIn, &s.CaptionTikTok, &s.Hashtags, &s.CTA, &s.EstimatedDurationSeconds, &s.WordCount, &s.CreatedAt)
+	err := row.Scan(&s.ID, &s.ContentPlanID, &s.Title, &s.Script, &s.TimelineJSON, &s.CaptionInstagram, &s.CaptionFacebook, &s.CaptionLinkedIn, &s.CaptionTikTok, &s.Hashtags, &s.CTA, &s.EstimatedDurationSeconds, &s.WordCount, &s.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
