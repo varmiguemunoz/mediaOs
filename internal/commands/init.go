@@ -51,37 +51,63 @@ func runInitWizard() error {
 	fmt.Println("── Configuración de API Keys ──────────────")
 	fmt.Println()
 
+	existing := loadExistingEnv(".env")
+
+	type field struct {
+		key      string
+		prompt   string
+		fallback string
+	}
+	fields := []field{
+		{"OPENAI_API_KEY", "OpenAI API Key (sk-...)", ""},
+		{"OPENAI_MODEL", "OpenAI Model", "gpt-4o"},
+		{"HEYGEN_API_KEY", "HeyGen API Key", ""},
+		{"EVOLUTION_BASE_URL", "Evolution API Base URL (ej: https://tudominio.com)", ""},
+		{"EVOLUTION_API_KEY", "Evolution API Key", ""},
+		{"EVOLUTION_INSTANCE", "Evolution Instance name", ""},
+		{"WHATSAPP_APPROVAL_NUMBER", "Tu número de WhatsApp (ej: 573001234567)", ""},
+		{"CRON_SCHEDULE", "Cron schedule", "0 8 * * 1,4"},
+		{"DB_PATH", "Ruta de la base de datos", "./content.db"},
+		{"HYPERFRAMES_DIR", "Directorio HyperFrames", "./hyperframes"},
+		{"EDITS_DIR", "Directorio de ediciones", "./edits"},
+		{"VIDEO_WIDTH", "Ancho del video", "1080"},
+		{"VIDEO_HEIGHT", "Alto del video", "1920"},
+		{"VIDEO_FPS", "FPS del video", "30"},
+		{"EDITOR_LAYOUT", "Layout del editor (pip/split)", "pip"},
+	}
+
 	reader := bufio.NewReader(os.Stdin)
-	ask := func(prompt, defaultVal string) string {
-		if defaultVal != "" {
-			fmt.Printf("%s [%s]: ", prompt, defaultVal)
+	cfg := make(map[string]string)
+	asked := 0
+
+	for _, f := range fields {
+		if val, ok := existing[f.key]; ok && val != "" {
+			cfg[f.key] = val
+			fmt.Printf("✅ %-30s ya configurada\n", f.key)
+			continue
+		}
+		effective := f.fallback
+		if existing[f.key] != "" {
+			effective = existing[f.key]
+		}
+		if effective != "" {
+			fmt.Printf("%s [%s]: ", f.prompt, effective)
 		} else {
-			fmt.Printf("%s: ", prompt)
+			fmt.Printf("%s: ", f.prompt)
 		}
 		line, _ := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line == "" {
-			return defaultVal
+			cfg[f.key] = effective
+		} else {
+			cfg[f.key] = line
 		}
-		return line
+		asked++
 	}
 
-	cfg := map[string]string{}
-	cfg["OPENAI_API_KEY"] = ask("OpenAI API Key (sk-...)", "")
-	cfg["OPENAI_MODEL"] = ask("OpenAI Model", "gpt-4o")
-	cfg["HEYGEN_API_KEY"] = ask("HeyGen API Key", "")
-	cfg["EVOLUTION_BASE_URL"] = ask("Evolution API Base URL (ej: https://tudominio.com)", "")
-	cfg["EVOLUTION_API_KEY"] = ask("Evolution API Key", "")
-	cfg["EVOLUTION_INSTANCE"] = ask("Evolution Instance name", "")
-	cfg["WHATSAPP_APPROVAL_NUMBER"] = ask("Tu número de WhatsApp (ej: 573001234567)", "")
-	cfg["CRON_SCHEDULE"] = ask("Cron schedule", "0 8 * * 1,4")
-	cfg["DB_PATH"] = ask("Ruta de la base de datos", "./content.db")
-	cfg["HYPERFRAMES_DIR"] = ask("Directorio HyperFrames", "./hyperframes")
-	cfg["EDITS_DIR"] = ask("Directorio de ediciones", "./edits")
-	cfg["VIDEO_WIDTH"] = ask("Ancho del video", "1080")
-	cfg["VIDEO_HEIGHT"] = ask("Alto del video", "1920")
-	cfg["VIDEO_FPS"] = ask("FPS del video", "30")
-	cfg["EDITOR_LAYOUT"] = ask("Layout del editor (pip/split)", "pip")
+	if asked == 0 {
+		fmt.Println("\n✅ Todas las variables ya estaban configuradas en .env")
+	}
 
 	if cfg["OPENAI_API_KEY"] == "" {
 		return fmt.Errorf("OPENAI_API_KEY es requerida")
@@ -123,6 +149,25 @@ func runInitWizard() error {
 	fmt.Println("  content uninstall      → elimina el servicio del sistema")
 	fmt.Println()
 	return nil
+}
+
+func loadExistingEnv(path string) map[string]string {
+	result := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return result
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	return result
 }
 
 func ensureHomebrew() error {

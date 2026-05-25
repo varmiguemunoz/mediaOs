@@ -34,27 +34,39 @@ func NewCronCmd(cfg *config.Config, database *db.DB) *cobra.Command {
 
 func runCron(cfg *config.Config, database *db.DB, runNow bool) error {
 	fmt.Println("🕐 Iniciando cron de generación de contenido...")
-	fmt.Printf("   Schedule: %s (lunes y jueves a las 8:00 AM)\n", cfg.CronSchedule)
+	fmt.Printf("   Plan semanal: %s\n", cfg.CronSchedule)
+	fmt.Println("   Check-videos: cada 30 minutos")
 	fmt.Println("   Presiona Ctrl+C para detener.\n")
 
 	c := cron.New()
 
-	jobFn := func() {
-		fmt.Printf("\n[%s] ⚡ Ejecutando generación de plan de contenido...\n", time.Now().Format("2006-01-02 15:04:05"))
+	planFn := func() {
+		fmt.Printf("\n[%s] ⚡ Generando plan de contenido...\n", time.Now().Format("2006-01-02 15:04:05"))
 		if err := generateWeeklyPlan(cfg, database); err != nil {
-			fmt.Printf("[ERROR] %v\n", err)
+			fmt.Printf("[ERROR plan] %v\n", err)
 		}
 	}
 
-	if _, err := c.AddFunc(cfg.CronSchedule, jobFn); err != nil {
-		return fmt.Errorf("configurando cron: %w", err)
+	checkFn := func() {
+		fmt.Printf("\n[%s] 🔍 Revisando videos en HeyGen...\n", time.Now().Format("2006-01-02 15:04:05"))
+		if err := runCheckVideos(cfg, database); err != nil {
+			fmt.Printf("[ERROR check-videos] %v\n", err)
+		}
+	}
+
+	if _, err := c.AddFunc(cfg.CronSchedule, planFn); err != nil {
+		return fmt.Errorf("configurando cron plan: %w", err)
+	}
+
+	if _, err := c.AddFunc("*/30 * * * *", checkFn); err != nil {
+		return fmt.Errorf("configurando cron check-videos: %w", err)
 	}
 
 	c.Start()
 
 	if runNow {
-		fmt.Println("▶️  Ejecutando ahora por --now flag...\n")
-		jobFn()
+		fmt.Println("▶️  Ejecutando plan ahora por --now flag...\n")
+		planFn()
 	}
 
 	sig := make(chan os.Signal, 1)
